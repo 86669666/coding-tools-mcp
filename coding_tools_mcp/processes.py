@@ -217,6 +217,7 @@ class ExecSession:
         else:
             status = "running" if self.process.poll() is None else "exited"
         payload: dict[str, Any] = {
+            "run_id": self.session_id,
             "session_id": self.session_id,
             "status": status,
             "exit_code": self.exit_code,

@@ -23,9 +23,12 @@ below. Unless that switch is set, the annotations in this document are what
 - Streamable HTTP uses `POST /mcp`. `DELETE /mcp` terminates the selected
   `Mcp-Session-Id`. Because this server does not provide an SSE stream,
   `GET /mcp` and `HEAD /mcp` return `405`.
-- Each successful HTTP `initialize` creates an independent runtime. Its cwd,
-  process sessions, retained output, and runtime directories are not shared
-  with other MCP sessions.
+- Each successful HTTP `initialize` creates an independent transport runtime.
+  Its default cwd and request context are not shared with other MCP sessions.
+  Command runs and retained output are workspace resources addressed by
+  `run_id`, so another authenticated client for the same workspace can continue
+  a run after reconnecting. `session_id` remains a compatibility alias for
+  command tools.
 - Subsequent HTTP messages must include the returned `Mcp-Session-Id` and the
   negotiated `MCP-Protocol-Version`. Unknown or expired sessions return `404`.
 - JSON-RPC batches are rejected. Cancellation uses
@@ -129,10 +132,11 @@ short command normally finishes in one call. A running command returns:
 ```json
 {
   "status": "running",
+  "run_id": "...",
   "session_id": "...",
   "next_action": {
     "tool": "write_stdin",
-    "arguments": {"session_id": "...", "chars": "", "yield_time_ms": 10000}
+    "arguments": {"run_id": "...", "chars": "", "yield_time_ms": 10000}
   }
 }
 ```
@@ -259,7 +263,7 @@ exits use `terminated`. Ordinary non-zero exit codes still use `exited`.
 
 ### write_stdin
 
-Inputs: `"session_id"`, `"chars"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
+Inputs: `"run_id"` (preferred), `"session_id"` (compatibility alias), `"chars"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
 
 Annotations: `{"title":"Write stdin","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}`.
 
@@ -267,7 +271,7 @@ Poll or interact with a command session. Pass empty `chars` to wait for output.
 
 ### kill_session
 
-Inputs: `"session_id"`, `"signal"`, `"wait_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
+Inputs: `"run_id"` (preferred), `"session_id"` (compatibility alias), `"signal"`, `"wait_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
 
 Annotations: `{"title":"Kill session","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}`.
 

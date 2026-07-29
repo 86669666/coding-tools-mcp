@@ -10,17 +10,18 @@ tool after a command starts.
 
 `exec_command` waits up to 10 seconds by default. If the command exits in that
 window, the result is complete and no polling call is needed. If it is still
-running, the result contains a `session_id` and an exact `next_action`, for
-example:
+running, the result contains a `run_id` plus the legacy `session_id` alias and
+an exact `next_action`, for example:
 
 ```json
 {
   "status": "running",
+  "run_id": "run_123",
   "session_id": "sess_123",
   "next_action": {
     "tool": "write_stdin",
     "arguments": {
-      "session_id": "sess_123",
+      "run_id": "run_123",
       "chars": "",
       "yield_time_ms": 10000
     }

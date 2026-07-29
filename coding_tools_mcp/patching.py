@@ -319,6 +319,13 @@ def parse_patch(patch: str) -> list[PatchOperation]:
                 i += 1
             if current:
                 hunks.append(current)
+            if not hunks and not move_to:
+                raise ToolFailure(
+                    "PATCH_FAILED",
+                    f"Update File operation for {path} must include a hunk or Move to target.",
+                    category="validation",
+                    details={"path": path, "conflict_type": "empty_update"},
+                )
             operations.append(PatchOperation("update", path, hunks=hunks, move_to=move_to))
             continue
         raise ToolFailure("PATCH_FAILED", f"Unrecognized patch line: {line}", category="validation")

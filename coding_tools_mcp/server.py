@@ -52,6 +52,7 @@ from .oauth import (
 from .patching import (
     AtomicPatchCommitter,
     FileBaseline,
+    PatchOperation,
     StagedFile,
     apply_update_hunks,
     parse_patch,
@@ -1431,6 +1432,10 @@ class Runtime:
         tools = self.exposed_tool_names()
         landlock = landlock_status_payload()
         landlock["enabled"] = self._landlock_enforced(landlock)
+        landlock["toolchain_allow_roots"] = {
+            "access": "read_execute",
+            "sources": guard_allow_root_sources(),
+        }
         return {
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
@@ -2107,6 +2112,7 @@ class Runtime:
         dry_run = bool(args.get("dry_run", False))
         with self.patch_lock:
             operations = parse_patch(patch)
+            self._validate_patch_operation_graph(operations)
             staged: dict[str, StagedFile] = {}
             summaries: list[str] = []
             affected: list[dict[str, str]] = []
@@ -2204,6 +2210,108 @@ class Runtime:
             "removals": removals,
             "warnings": [],
         }
+
+    def _validate_patch_operation_graph(self, operations: list[PatchOperation]) -> None:
+        """Reject patch operations whose combined paths cannot be staged safely."""
+        entries: list[dict[str, Any]] = []
+        source_operations: dict[str, dict[str, Any]] = {}
+        target_writers: dict[str, dict[str, Any]] = {}
+
+        for operation_index, op in enumerate(operations, start=1):
+            source = self._resolve_patch_source(op)
+            target = self._resolve_patch_target(op, source)
+            entry = {
+                "index": operation_index,
+                "kind": op.kind,
+                "source_path": source,
+                "target_path": target,
+            }
+
+            if op.kind == "update" and op.move_to and source == target:
+                self._raise_patch_path_conflict("meaningless_move", [entry], [source])
+
+            previous_source = source_operations.get(source)
+            if previous_source is not None:
+                conflict_type = "duplicate_source_operation"
+                if previous_source["kind"] == "delete" and op.kind == "update":
+                    conflict_type = "source_deleted_then_updated"
+                self._raise_patch_path_conflict(conflict_type, [previous_source, entry], [source])
+            source_operations[source] = entry
+
+            if target is not None:
+                previous_target = target_writers.get(target)
+                if previous_target is not None:
+                    conflict_type = "duplicate_target_write"
+                    if previous_target["kind"] == "update" or op.kind == "update":
+                        if previous_target["target_path"] != previous_target["source_path"] or target != source:
+                            conflict_type = "move_target_conflict"
+                    self._raise_patch_path_conflict(conflict_type, [previous_target, entry], [target])
+                target_writers[target] = entry
+
+            entries.append(entry)
+
+        move_by_source = {
+            entry["source_path"]: entry
+            for entry in entries
+            if entry["kind"] == "update" and entry["target_path"] != entry["source_path"]
+        }
+        for entry in move_by_source.values():
+            chain = [entry]
+            seen_sources = {entry["source_path"]}
+            next_path = entry["target_path"]
+            while next_path in move_by_source:
+                next_entry = move_by_source[next_path]
+                chain.append(next_entry)
+                next_path = next_entry["target_path"]
+                if next_path in seen_sources:
+                    self._raise_patch_path_conflict(
+                        "move_cycle",
+                        chain,
+                        [item["source_path"] for item in chain],
+                    )
+                seen_sources.add(next_entry["source_path"])
+            if len(chain) > 1:
+                self._raise_patch_path_conflict(
+                    "move_chain",
+                    chain,
+                    [item["source_path"] for item in chain],
+                )
+
+    def _resolve_patch_source(self, op: PatchOperation) -> str:
+        require_existing = op.kind in {"update", "delete"}
+        self._validate_patch_path(op.path, require_existing=require_existing)
+        self.workspace.reject_write_symlink(op.path)
+        if require_existing:
+            return self.workspace.resolve_existing(op.path).display
+        return self.workspace.resolve_for_write(op.path).display
+
+    def _resolve_patch_target(self, op: PatchOperation, source: str) -> str | None:
+        if op.kind == "delete":
+            return None
+        if not op.move_to:
+            return source
+        self._validate_patch_path(op.move_to, require_existing=False)
+        self.workspace.reject_write_symlink(op.move_to)
+        return self.workspace.resolve_for_write(op.move_to).display
+
+    @staticmethod
+    def _raise_patch_path_conflict(
+        conflict_type: str,
+        entries: list[dict[str, Any]],
+        paths: list[str],
+    ) -> None:
+        operation_indexes = [entry["index"] for entry in entries]
+        raise ToolFailure(
+            "PATCH_PATH_CONFLICT",
+            f"Patch path conflict ({conflict_type}): {', '.join(paths)}.",
+            category="conflict",
+            details={
+                "conflict_type": conflict_type,
+                "paths": paths,
+                "operation_indexes": operation_indexes,
+                "operations": entries,
+            },
+        )
 
     def _validate_patch_path(self, raw_path: str, *, require_existing: bool) -> None:
         if require_existing:
@@ -4078,47 +4186,84 @@ def _resolved_system_path_root_prefixes() -> tuple[Path, ...]:
 
 
 def guard_allow_roots() -> list[str]:
-    # Keyed on the env vars the computation reads, so repeated exec_command
-    # calls skip the dozens of Path.resolve()/is_dir() syscalls while env
-    # changes still invalidate the cache.
-    return list(
-        _guard_allow_roots_cached(
-            os.environ.get("JAVA_HOME", ""),
-            os.environ.get("PATH", ""),
-            os.environ.get(f"{ENV_PREFIX}_EXEC_ALLOW_ROOTS", ""),
-        )
+    return [root for root, _sources in _guard_allow_root_entries()]
+
+
+def guard_allow_root_sources() -> dict[str, list[str]]:
+    return {root: list(sources) for root, sources in _guard_allow_root_entries()}
+
+
+def _guard_allow_root_entries() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return _guard_allow_root_entries_for_env(
+        os.environ.get("JAVA_HOME", ""),
+        os.environ.get("PATH", ""),
+        os.environ.get(f"{ENV_PREFIX}_EXEC_ALLOW_ROOTS", ""),
     )
 
 
-@functools.lru_cache(maxsize=8)
-def _guard_allow_roots_cached(java_home: str, path_env: str, extra_roots: str) -> tuple[str, ...]:
-    roots = set(TOOLCHAIN_READ_ROOTS)
-    roots.update(OS_METADATA_READ_FILES)
-    roots.update(GIT_READ_ROOTS)
-    roots.update(DNS_RESOLVER_READ_ROOTS)
-    roots.update(
-        {
-            str(Path(sys.executable).resolve().parent),
-            str(Path(sys.prefix).resolve()),
-            str(Path(sys.base_prefix).resolve()),
-        }
-    )
+def _path_toolchain_roots(path_dir: Path) -> set[Path]:
+    roots = {path_dir}
+    install_root = path_dir.parent if path_dir.name in {"bin", "sbin"} else path_dir
+    try:
+        entries = list(path_dir.iterdir())
+    except OSError:
+        return roots
+    for entry in entries:
+        try:
+            if not entry.is_file() or not os.access(entry, os.X_OK):
+                continue
+            executable = entry.resolve(strict=True)
+        except OSError:
+            continue
+        if entry.is_symlink() and is_relative_to(executable, install_root):
+            roots.add(install_root)
+        else:
+            roots.add(executable.parent)
+    return roots
+
+
+def _guard_allow_root_entries_for_env(
+    java_home: str, path_env: str, extra_roots: str
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    roots: dict[str, set[str]] = {}
+
+    def add_root(path: Path | str, source: str) -> None:
+        root = str(path)
+        if root and Path(root).is_absolute():
+            roots.setdefault(root, set()).add(source)
+
+    for root in TOOLCHAIN_READ_ROOTS:
+        add_root(root, "built_in_toolchain")
+    for root in OS_METADATA_READ_FILES:
+        add_root(root, "os_metadata")
+    for root in GIT_READ_ROOTS:
+        add_root(root, "git_config")
+    for root in DNS_RESOLVER_READ_ROOTS:
+        add_root(root, "dns_resolver")
+    add_root(Path(sys.executable).resolve().parent, "python_runtime")
+    add_root(Path(sys.prefix).resolve(), "python_runtime")
+    add_root(Path(sys.base_prefix).resolve(), "python_runtime")
     if java_home:
         try:
             resolved_java_home = Path(java_home).expanduser().resolve()
         except OSError:
             pass
         else:
-            roots.add(str(resolved_java_home))
+            add_root(resolved_java_home, "JAVA_HOME")
     for item in path_env.split(os.pathsep):
         if not item:
             continue
         try:
-            resolved = Path(item).resolve()
+            resolved = Path(item).expanduser().resolve()
         except OSError:
             continue
-        if resolved.is_dir() and is_default_system_path_root(resolved):
-            roots.add(str(resolved))
+        if not resolved.is_dir():
+            continue
+        if is_default_system_path_root(resolved):
+            add_root(resolved, "PATH_system")
+            continue
+        for root in _path_toolchain_roots(resolved):
+            add_root(root, "PATH_toolchain")
     for item in extra_roots.split(os.pathsep):
         if not item:
             continue
@@ -4127,8 +4272,8 @@ def _guard_allow_roots_cached(java_home: str, path_env: str, extra_roots: str) -
         except OSError:
             continue
         if resolved.is_dir():
-            roots.add(str(resolved))
-    return tuple(sorted(root for root in roots if root and Path(root).is_absolute()))
+            add_root(resolved, f"{ENV_PREFIX}_EXEC_ALLOW_ROOTS")
+    return tuple((root, tuple(sorted(sources))) for root, sources in sorted(roots.items()))
 
 
 def parse_diff_files(diff_text: str) -> list[dict[str, Any]]:
@@ -5527,8 +5672,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--port",
         type=int,
-        default=env_int(f"{ENV_PREFIX}_PORT", 8000),
-        help=f"bind port; defaults to {ENV_PREFIX}_PORT or 8000",
+        default=env_int(f"{ENV_PREFIX}_PORT", 8765),
+        help=f"bind port; defaults to {ENV_PREFIX}_PORT or 8765",
     )
     parser.add_argument("--stdio", action="store_true", help="serve newline-delimited JSON-RPC over stdio")
     parser.add_argument(

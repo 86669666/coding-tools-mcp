@@ -740,20 +740,33 @@ class RuntimeHelperTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             java_home = Path(tmp) / "jdk"
             explicit_root = Path(tmp) / "explicit-root"
-            private_path_dir = Path(tmp) / "bin"
+            install_root = Path(tmp) / "node"
+            private_path_dir = install_root / "bin"
+            npm_cli = install_root / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+            user_root = Path(tmp) / "user"
+            user_bin = user_root / "bin"
             java_home.mkdir()
             explicit_root.mkdir()
-            private_path_dir.mkdir()
+            private_path_dir.mkdir(parents=True)
+            user_bin.mkdir(parents=True)
+            (user_bin / "tool").write_text("#!/bin/sh\nexit 0\n")
+            (user_bin / "tool").chmod(0o755)
+            npm_cli.parent.mkdir(parents=True)
+            npm_cli.write_text("#!/usr/bin/env node\n")
+            npm_cli.chmod(0o755)
+            if os.name != "nt":
+                (private_path_dir / "npm").symlink_to(npm_cli)
             with patch.dict(
                 server_module.os.environ,
                 {
-                    "PATH": str(private_path_dir),
+                    "PATH": os.pathsep.join((str(private_path_dir), str(user_bin))),
                     "JAVA_HOME": str(java_home),
                     "CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS": str(explicit_root),
                 },
                 clear=True,
             ):
                 roots = set(guard_allow_roots())
+                info = Runtime(Path(tmp)).server_info_payload()
         self.assertIn("/etc/resolv.conf", roots)
         self.assertIn("/etc/hosts", roots)
         self.assertIn("/usr", roots)
@@ -762,7 +775,20 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertIn("/etc/gitconfig.d", roots)
         self.assertIn(str(java_home.resolve()), roots)
         self.assertIn(str(explicit_root.resolve()), roots)
-        self.assertNotIn(str(private_path_dir.resolve()), roots)
+        self.assertIn(str(private_path_dir.resolve()), roots)
+        if os.name != "nt":
+            self.assertIn(str(install_root.resolve()), roots)
+        self.assertIn(str(user_bin.resolve()), roots)
+        self.assertNotIn(str(user_root.resolve()), roots)
+        toolchain_roots = info.get("landlock", {}).get("toolchain_allow_roots", {})
+        self.assertEqual(toolchain_roots.get("access"), "read_execute")
+        sources = toolchain_roots.get("sources", {})
+        path_source_root = install_root if os.name != "nt" else private_path_dir
+        self.assertIn("PATH_toolchain", sources.get(str(path_source_root.resolve()), []))
+        self.assertIn(
+            "CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS",
+            sources.get(str(explicit_root.resolve()), []),
+        )
 
     def test_safe_exec_git_init_and_local_config_reads_system_git_config_roots(self) -> None:
         if shutil.which("git") is None:
@@ -1567,6 +1593,12 @@ class FakeReadonlyAnnotationTests(unittest.TestCase):
 
         args = parser.parse_args(["--dangerously-fake-readonly-annotations", "--permission-mode", "dangerous"])
         self.assertTrue(server_module.runtime_policy_from_args(args).fake_readonly_annotations)
+
+    def test_parser_default_http_port_matches_documentation(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODING_TOOLS_MCP_PORT", None)
+            args = server_module.build_parser().parse_args([])
+        self.assertEqual(args.port, 8765)
 
     def test_policy_from_args_reads_the_environment_switch(self) -> None:
         parser = server_module.build_parser()

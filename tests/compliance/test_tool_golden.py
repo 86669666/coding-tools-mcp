@@ -150,6 +150,107 @@ class ApplyPatchGoldenTests(ComplianceTestCase):
 """
         self.assert_tool_error("apply_patch", {"patch": mismatch})
 
+    def test_apply_patch_rejects_duplicate_and_conflicting_path_operations(self) -> None:
+        (self.workspace.root / "move-a.txt").write_text("a\n", encoding="utf-8")
+        (self.workspace.root / "move-b.txt").write_text("b\n", encoding="utf-8")
+        cases = (
+            (
+                "duplicate_source_operation",
+                """*** Begin Patch
+*** Add File: duplicate.txt
++first
+*** Add File: duplicate.txt
++second
+*** End Patch
+""",
+                "PATCH_PATH_CONFLICT",
+                "duplicate_source_operation",
+            ),
+            (
+                "move_target_conflict",
+                """*** Begin Patch
+*** Add File: shared-target.txt
++new
+*** Update File: TODO.md
+*** Move to: shared-target.txt
+*** End Patch
+""",
+                "PATCH_PATH_CONFLICT",
+                "move_target_conflict",
+            ),
+            (
+                "source_deleted_then_updated",
+                """*** Begin Patch
+*** Delete File: TODO.md
+*** Update File: TODO.md
+@@
+-Keep this file available.
++Updated.
+*** End Patch
+""",
+                "PATCH_PATH_CONFLICT",
+                "source_deleted_then_updated",
+            ),
+            (
+                "move_cycle",
+                """*** Begin Patch
+*** Update File: move-a.txt
+*** Move to: move-b.txt
+*** Update File: move-b.txt
+*** Move to: move-a.txt
+*** End Patch
+""",
+                "PATCH_PATH_CONFLICT",
+                "move_cycle",
+            ),
+            (
+                "move_chain",
+                """*** Begin Patch
+*** Update File: move-a.txt
+*** Move to: move-b.txt
+*** Update File: move-b.txt
+*** Move to: move-c.txt
+*** End Patch
+""",
+                "PATCH_PATH_CONFLICT",
+                "move_chain",
+            ),
+            (
+                "meaningless_move",
+                """*** Begin Patch
+*** Update File: TODO.md
+*** Move to: TODO.md
+*** End Patch
+""",
+                "PATCH_PATH_CONFLICT",
+                "meaningless_move",
+            ),
+            (
+                "empty_update",
+                """*** Begin Patch
+*** Update File: TODO.md
+*** End Patch
+""",
+                "PATCH_FAILED",
+                "empty_update",
+            ),
+        )
+
+        for name, patch, expected_code, expected_type in cases:
+            with self.subTest(name=name):
+                payload = self.assert_tool_error("apply_patch", {"patch": patch})
+                error = payload.get("error", {})
+                self.assertEqual(error.get("code"), expected_code)
+                details = error.get("details", {})
+                self.assertEqual(details.get("conflict_type"), expected_type)
+                if expected_code == "PATCH_PATH_CONFLICT":
+                    self.assertTrue(details.get("paths"))
+                    self.assertTrue(details.get("operation_indexes"))
+                    self.assertTrue(details.get("operations"))
+
+        self.assertFalse((self.workspace.root / "duplicate.txt").exists())
+        self.assertFalse((self.workspace.root / "shared-target.txt").exists())
+
     def test_apply_patch_preserves_bom_crlf_and_rejects_ambiguous_context(self) -> None:
         crlf_file = self.workspace.root / "src" / "crlf.txt"
         crlf_file.write_bytes("\ufeffalpha\r\nold\r\nomega\r\n".encode("utf-8"))
